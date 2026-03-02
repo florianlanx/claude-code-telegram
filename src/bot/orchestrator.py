@@ -6,12 +6,14 @@ classic mode, delegates to existing full-featured handlers.
 """
 
 import asyncio
+import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import structlog
+import yaml
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -114,6 +116,8 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+        # Scan Claude Code skills for Telegram command menu integration
+        self._skills: Dict[str, str] = self._scan_skills()
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -288,6 +292,102 @@ class MessageOrchestrator:
         if update.effective_message:
             await update.effective_message.reply_text(message, parse_mode="HTML")
 
+    # --- Claude Code Skill scanning ---
+
+    def _scan_skills(self) -> Dict[str, str]:
+        """Scan Claude Code skills directory and return {tg_command: description}.
+
+        Reads SKILL.md YAML frontmatter from each skill subdirectory to extract
+        the skill name and description, then normalises the name into a valid
+        Telegram bot command (lowercase a-z, 0-9, underscores only).
+        """
+        skills_dir = self.settings.skills_dir
+        if not skills_dir:
+            return {}
+
+        skills_path = Path(os.path.expanduser(skills_dir))
+        if not skills_path.is_dir():
+            logger.warning("Skills directory not found", path=str(skills_path))
+            return {}
+
+        skills: Dict[str, str] = {}
+        for entry in sorted(skills_path.iterdir()):
+            if not entry.is_dir():
+                continue
+            skill_file = entry / "SKILL.md"
+            if not skill_file.exists():
+                continue
+
+            # Normalise to valid Telegram command: lowercase, a-z 0-9 _
+            tg_cmd = re.sub(r"[^a-z0-9_]", "_", entry.name.lower())
+            desc = self._extract_skill_desc(skill_file)
+            if desc:
+                skills[tg_cmd] = desc
+
+        if skills:
+            logger.info("Loaded Claude Code skills", count=len(skills), names=list(skills.keys()))
+        return skills
+
+    @staticmethod
+    def _extract_skill_desc(skill_file: Path) -> str:
+        """Extract short description from SKILL.md YAML frontmatter."""
+        try:
+            text = skill_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        m = re.match(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+        if not m:
+            return ""
+        try:
+            meta = yaml.safe_load(m.group(1))
+        except Exception:
+            return ""
+        if not isinstance(meta, dict):
+            return ""
+        raw_desc = meta.get("description", "")
+        if not raw_desc:
+            return ""
+        # Take the first sentence as a short description (Telegram limit: 256 chars)
+        first_line = str(raw_desc).split("\n")[0].split("\u3002")[0].split(". ")[0]
+        return first_line[:200]
+
+    async def _handle_skill_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle a Telegram command that maps to a Claude Code skill.
+
+        Converts the Telegram command back to the original skill name and
+        forwards it as a prompt to Claude CLI, which natively recognises
+        ``/skill-name`` triggers.
+        """
+        user_id = update.effective_user.id
+        text = update.message.text or ""
+
+        # Parse /command_name optional_args
+        parts = text.split(None, 1)
+        tg_cmd = parts[0].lstrip("/")
+        args = parts[1] if len(parts) > 1 else ""
+
+        # Restore original skill name: underscores back to hyphens
+        skill_name = tg_cmd.replace("_", "-")
+
+        # Build prompt that Claude CLI will interpret as a skill invocation
+        prompt = f"/{skill_name}"
+        if args:
+            prompt += f" {args}"
+
+        logger.info(
+            "Skill command triggered",
+            user_id=user_id,
+            skill=skill_name,
+            tg_command=tg_cmd,
+        )
+
+        # Reuse agentic_text logic by injecting the prompt into the message
+        # We modify message.text temporarily, then delegate to agentic_text
+        update.message.text = prompt
+        await self.agentic_text(update, context)
+
     def register_handlers(self, app: Application) -> None:
         """Register handlers based on mode."""
         if self.settings.agentic_mode:
@@ -312,6 +412,12 @@ class MessageOrchestrator:
 
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
+
+        # Claude Code skill commands (e.g. /market_research -> /market-research)
+        for skill_cmd in self._skills:
+            app.add_handler(
+                CommandHandler(skill_cmd, self._inject_deps(self._handle_skill_command))
+            )
 
         # Text messages -> Claude
         app.add_handler(
@@ -406,7 +512,6 @@ class MessageOrchestrator:
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
-            return commands
         else:
             commands = [
                 BotCommand("start", "Start bot and show help"),
@@ -425,7 +530,12 @@ class MessageOrchestrator:
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
-            return commands
+
+        # Append Claude Code skills to the command menu
+        for name, desc in sorted(self._skills.items()):
+            commands.append(BotCommand(name, desc[:256]))
+
+        return commands
 
     # --- Agentic handlers ---
 

@@ -121,6 +121,15 @@ class Settings(BaseSettings):
         description="List of explicitly disallowed Claude tools/commands",
     )
 
+    # Claude Code skills directory (for Telegram command menu integration)
+    skills_dir: Optional[str] = Field(
+        None,
+        description=(
+            "Path to Claude Code skills directory (e.g. ~/.claude/skills). "
+            "Skills found here are registered as Telegram bot commands."
+        ),
+    )
+
     # Sandbox settings
     sandbox_enabled: bool = Field(
         True,
