@@ -147,3 +147,9 @@ sessions/
 backups/
 uploads/
 config/mcp.json
+
+# Personal fork docs (not for upstream)
+FORK_ADAPTATIONS.md
+
+# IDE
+.codebuddy/
