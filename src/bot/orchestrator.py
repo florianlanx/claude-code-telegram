@@ -117,6 +117,7 @@ class MessageOrchestrator:
         self.settings = settings
         self.deps = deps
         # Scan Claude Code skills for Telegram command menu integration
+        self._skill_paths: Dict[str, Path] = {}
         self._skills: Dict[str, str] = self._scan_skills()
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
@@ -323,6 +324,7 @@ class MessageOrchestrator:
             desc = self._extract_skill_desc(skill_file)
             if desc:
                 skills[tg_cmd] = desc
+                self._skill_paths[tg_cmd] = skill_file
 
         if skills:
             logger.info("Loaded Claude Code skills", count=len(skills), names=list(skills.keys()))
@@ -356,9 +358,8 @@ class MessageOrchestrator:
     ) -> None:
         """Handle a Telegram command that maps to a Claude Code skill.
 
-        Converts the Telegram command back to the original skill name and
-        forwards it as a prompt to Claude CLI, which natively recognises
-        ``/skill-name`` triggers.
+        Reads the full SKILL.md content and injects it into the prompt so that
+        the Claude SDK (which has no built-in skill system) can execute it.
         """
         user_id = update.effective_user.id
         text = update.message.text or ""
@@ -371,10 +372,22 @@ class MessageOrchestrator:
         # Restore original skill name: underscores back to hyphens
         skill_name = tg_cmd.replace("_", "-")
 
-        # Build prompt that Claude CLI will interpret as a skill invocation
-        prompt = f"/{skill_name}"
-        if args:
-            prompt += f" {args}"
+        # Read SKILL.md content to inject into prompt
+        skill_path = self._skill_paths.get(tg_cmd)
+        if skill_path and skill_path.exists():
+            skill_content = skill_path.read_text(encoding="utf-8")
+            prompt = (
+                f"Execute the following skill.\n\n"
+                f"<skill-name>{skill_name}</skill-name>\n\n"
+                f"{skill_content}"
+            )
+            if args:
+                prompt += f"\n\nUser arguments: {args}"
+        else:
+            # Fallback for skills without a readable SKILL.md
+            prompt = f"/{skill_name}"
+            if args:
+                prompt += f" {args}"
 
         logger.info(
             "Skill command triggered",
@@ -383,10 +396,8 @@ class MessageOrchestrator:
             tg_command=tg_cmd,
         )
 
-        # Reuse agentic_text logic by injecting the prompt into the message
-        # We modify message.text temporarily, then delegate to agentic_text
-        update.message.text = prompt
-        await self.agentic_text(update, context)
+        # Reuse agentic_text logic by passing the skill prompt directly
+        await self.agentic_text(update, context, override_text=prompt)
 
     def register_handlers(self, app: Application) -> None:
         """Register handlers based on mode."""
@@ -930,11 +941,12 @@ class MessageOrchestrator:
         return caption_sent
 
     async def agentic_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        *, override_text: Optional[str] = None,
     ) -> None:
         """Direct Claude passthrough. Simple progress. No suggestions."""
         user_id = update.effective_user.id
-        message_text = update.message.text
+        message_text = override_text or update.message.text
 
         logger.info(
             "Agentic text message",
