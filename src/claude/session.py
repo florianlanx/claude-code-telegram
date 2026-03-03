@@ -159,6 +159,25 @@ class SessionManager:
                 logger.info("Loaded session from storage", session_id=session_id)
                 return session
 
+            # Session not in Bot DB but caller explicitly requested this ID
+            # (e.g. resuming a CLI session). Create a stub so the SDK can
+            # attempt to resume it on Claude's side.
+            if not session:
+                stub = ClaudeSession(
+                    session_id=session_id,
+                    user_id=user_id,
+                    project_path=project_path,
+                    created_at=datetime.now(UTC),
+                    last_used=datetime.now(UTC),
+                    is_new_session=False,  # Not new — SDK should resume
+                )
+                self.active_sessions[session_id] = stub
+                logger.info(
+                    "Created stub session for external resume",
+                    session_id=session_id,
+                )
+                return stub
+
         # Check user session limit
         user_sessions = await self._get_user_sessions(user_id)
         if len(user_sessions) >= self.config.max_sessions_per_user:

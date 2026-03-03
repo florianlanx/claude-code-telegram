@@ -102,6 +102,130 @@ def _format_time_ago(iso_time: str) -> str:
     return f"{delta.days}d ago"
 
 
+def _scan_cli_sessions(limit: int = 15) -> List[Dict[str, Any]]:
+    """Scan Claude Code CLI session files for resumable sessions.
+
+    Returns a list of dicts with: session_id, cwd, first_prompt, timestamp.
+    Sorted by timestamp descending (most recent first).
+    """
+    import glob
+    import json as _json
+
+    base = os.path.expanduser("~/.claude-internal/projects")
+    if not os.path.isdir(base):
+        return []
+
+    sessions: List[Dict[str, Any]] = []
+
+    for project_dir in glob.glob(f"{base}/*/"):
+        for jsonl_file in glob.glob(f"{project_dir}*.jsonl"):
+            fname = Path(jsonl_file).stem
+            if fname.startswith("agent-"):
+                continue
+
+            first_prompt = ""
+            session_id = ""
+            cwd = ""
+            timestamp = ""
+
+            try:
+                with open(jsonl_file, encoding="utf-8") as f:
+                    for line in f:
+                        data = _json.loads(line)
+                        if not session_id and data.get("sessionId"):
+                            session_id = data["sessionId"]
+                        if not cwd and data.get("cwd"):
+                            cwd = data["cwd"]
+                        if not timestamp and data.get("timestamp"):
+                            timestamp = data["timestamp"]
+                        if data.get("type") == "user":
+                            msg = data.get("message", {})
+                            content = msg.get("content", "")
+                            if isinstance(content, str):
+                                first_prompt = content
+                            elif isinstance(content, list):
+                                for block in content:
+                                    if (
+                                        isinstance(block, dict)
+                                        and block.get("type") == "text"
+                                    ):
+                                        first_prompt = block["text"]
+                                        break
+                            break
+            except Exception:
+                continue
+
+            if session_id and timestamp:
+                sessions.append(
+                    {
+                        "session_id": session_id,
+                        "cwd": cwd,
+                        "first_prompt": first_prompt,
+                        "timestamp": timestamp,
+                    }
+                )
+
+    sessions.sort(key=lambda s: s["timestamp"], reverse=True)
+    return sessions[:limit]
+
+
+def _get_cli_session_history(session_id: str, max_turns: int = 3) -> List[Dict[str, str]]:
+    """Extract recent conversation turns from a CLI session JSONL file.
+
+    Returns list of dicts: [{"role": "user"|"assistant", "text": "..."}]
+    Up to max_turns user-assistant pairs (so up to max_turns*2 entries).
+    """
+    import glob
+    import json as _json
+
+    base = os.path.expanduser("~/.claude-internal/projects")
+    if not os.path.isdir(base):
+        return []
+
+    # Find the JSONL file matching this session_id
+    target_file = None
+    for project_dir in glob.glob(f"{base}/*/"):
+        candidate = os.path.join(project_dir, f"{session_id}.jsonl")
+        if os.path.isfile(candidate):
+            target_file = candidate
+            break
+
+    if not target_file:
+        return []
+
+    turns: List[Dict[str, str]] = []
+    try:
+        with open(target_file, encoding="utf-8") as f:
+            for line in f:
+                data = _json.loads(line)
+                msg_type = data.get("type")
+                if msg_type not in ("user", "assistant"):
+                    continue
+
+                content = data.get("message", {}).get("content", "")
+                if isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block["text"])
+                    content = "\n".join(text_parts)
+
+                if not isinstance(content, str) or not content.strip():
+                    continue
+
+                turns.append({"role": msg_type, "text": content.strip()})
+    except Exception:
+        return []
+
+    # Take last N user-assistant pairs
+    # Walk backwards to find the last max_turns user messages
+    if not turns:
+        return []
+
+    # Just return the first max_turns*2 messages (earliest context)
+    return turns[: max_turns * 2]
+
+
 # Tool name -> friendly emoji mapping for verbose output
 _TOOL_ICONS: Dict[str, str] = {
     "Read": "\U0001f4d6",
@@ -645,42 +769,100 @@ class MessageOrchestrator:
     async def agentic_resume(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Show resumable sessions as inline keyboard for manual selection."""
+        """Show resumable sessions as inline keyboard for manual selection.
+
+        Merges sessions from two sources:
+        1. Bot's own SQLite database (sessions created via Telegram)
+        2. Claude Code CLI session files (~/.claude-internal/projects/)
+        Deduplicates by session_id, sorted by most recent first.
+        """
         user_id = update.effective_user.id
-        claude_integration = context.bot_data.get("claude_integration")
+        storage = context.bot_data.get("storage")
 
-        if not claude_integration:
-            await update.message.reply_text(
-                "Claude integration not available. Check configuration."
+        # --- Source 1: Bot SQLite sessions ---
+        # Dict of session_id -> {prompt, time_iso, project_name}
+        merged: Dict[str, Dict[str, str]] = {}
+
+        if storage:
+            bot_sessions = await storage.sessions.get_user_sessions(
+                user_id, active_only=False
             )
-            return
+            for s in bot_sessions:
+                if not s.session_id:
+                    continue
+                # Fetch first prompt from messages table
+                first_prompt = ""
+                try:
+                    msgs = await storage.messages.get_session_messages(
+                        s.session_id, limit=100
+                    )
+                    if msgs:
+                        first_prompt = msgs[-1].prompt or ""
+                except Exception:
+                    pass
 
-        # Get all user sessions (sorted by last_used DESC)
-        sessions = await claude_integration.get_user_sessions(user_id)
+                merged[s.session_id] = {
+                    "prompt": first_prompt,
+                    "time": s.last_used.isoformat(),
+                    "project": Path(s.project_path).name,
+                    "cwd": str(s.project_path),
+                }
 
-        # Filter: must have a real session_id, limit to 8
-        resumable = [s for s in sessions if s.get("session_id")][:8]
+        # --- Source 2: CLI session files ---
+        cli_sessions = _scan_cli_sessions(limit=30)
+        for cs in cli_sessions:
+            sid = cs["session_id"]
+            if sid in merged:
+                # Bot record exists; fill in prompt if bot didn't have one
+                if not merged[sid]["prompt"] and cs["first_prompt"]:
+                    merged[sid]["prompt"] = cs["first_prompt"]
+                continue
+            merged[sid] = {
+                "prompt": cs["first_prompt"],
+                "time": cs["timestamp"],
+                "project": Path(cs["cwd"]).name if cs["cwd"] else "?",
+                "cwd": cs["cwd"] or "",
+            }
 
-        if not resumable:
+        if not merged:
             await update.message.reply_text(
                 "No sessions to resume. Send a message to start."
             )
             return
 
-        # Build inline keyboard — one session per row
-        buttons = []
-        for s in resumable:
-            project_name = Path(s["project_path"]).name
-            msgs = s["message_count"]
-            expired = s.get("expired", False)
-            time_ago = _format_time_ago(s["last_used"])
-            icon = "\u23f0" if expired else "\U0001f4c2"
-            label = f"{icon} {project_name} \u00b7 {msgs} msgs \u00b7 {time_ago}"
+        # Sort by time desc, take top 8
+        sorted_sessions = sorted(
+            merged.items(), key=lambda kv: kv[1]["time"], reverse=True
+        )[:8]
 
-            # Telegram callback_data max 64 bytes; "resume:" (7) + 32 = 39 chars
-            sid = s["session_id"][:32]
+        # Build inline keyboard
+        buttons = []
+        for sid, info in sorted_sessions:
+            time_ago = _format_time_ago(info["time"])
+            first_prompt = info["prompt"]
+
+            if first_prompt:
+                # Strip leading whitespace/newlines, clean up prompt display
+                clean = first_prompt.strip().split("\n")[0]
+                max_text = 28
+                truncated = (
+                    clean[:max_text] + "..."
+                    if len(clean) > max_text
+                    else clean
+                )
+                label = f'\U0001f4c2 "{truncated}" \u00b7 {time_ago}'
+            else:
+                label = (
+                    f"\U0001f4c2 {info['project']} \u00b7 {time_ago}"
+                )
+
+            # Telegram callback_data max 64 bytes; "resume:" (7) + 32 = 39
             buttons.append(
-                [InlineKeyboardButton(label, callback_data=f"resume:{sid}")]
+                [
+                    InlineKeyboardButton(
+                        label, callback_data=f"resume:{sid[:32]}"
+                    )
+                ]
             )
 
         buttons.append(
@@ -711,37 +893,86 @@ class MessageOrchestrator:
             return
 
         user_id = update.effective_user.id
-        claude_integration = context.bot_data.get("claude_integration")
-        if not claude_integration:
-            await query.edit_message_text("Claude integration not available.")
-            return
 
-        # Find matching session by prefix
-        sessions = await claude_integration.get_user_sessions(user_id)
-        match = next(
-            (
-                s
-                for s in sessions
-                if s["session_id"].startswith(session_id_prefix)
-            ),
-            None,
-        )
+        # Try to find session in Bot SQLite first
+        storage = context.bot_data.get("storage")
+        full_session_id = ""
+        cwd = ""
+        project_name = ""
 
-        if not match:
+        if storage:
+            all_sessions = await storage.sessions.get_user_sessions(
+                user_id, active_only=False
+            )
+            match = next(
+                (s for s in all_sessions if s.session_id.startswith(session_id_prefix)),
+                None,
+            )
+            if match:
+                full_session_id = match.session_id
+                cwd = str(match.project_path)
+                project_name = Path(match.project_path).name
+
+        # If not found in Bot DB, search CLI sessions
+        if not full_session_id:
+            cli_sessions = _scan_cli_sessions(limit=30)
+            cli_match = next(
+                (s for s in cli_sessions if s["session_id"].startswith(session_id_prefix)),
+                None,
+            )
+            if cli_match:
+                full_session_id = cli_match["session_id"]
+                cwd = cli_match["cwd"] or str(self.settings.approved_directory)
+                project_name = Path(cwd).name
+
+        if not full_session_id:
             await query.edit_message_text("Session not found or already removed.")
             return
 
         # Set session context for subsequent messages
-        context.user_data["claude_session_id"] = match["session_id"]
-        context.user_data["current_directory"] = Path(match["project_path"])
+        context.user_data["claude_session_id"] = full_session_id
+        context.user_data["current_directory"] = Path(cwd) if cwd else self.settings.approved_directory
         context.user_data["force_new_session"] = False
 
-        project_name = Path(match["project_path"]).name
-        msgs = match["message_count"]
+        # Build conversation summary from history
+        summary_lines = [f"\U0001f4c2 Resumed session in <b>{escape_html(project_name)}</b>"]
+
+        # Try CLI session history first (richer data)
+        history = _get_cli_session_history(full_session_id, max_turns=3)
+
+        # Fallback: try Bot SQLite messages
+        if not history and storage:
+            try:
+                db_msgs = await storage.messages.get_session_messages(
+                    full_session_id, limit=100
+                )
+                if db_msgs:
+                    # db_msgs is DESC, reverse for chronological order
+                    for m in reversed(db_msgs[:3]):
+                        if m.prompt:
+                            history.append({"role": "user", "text": m.prompt})
+                        if m.response:
+                            history.append({"role": "assistant", "text": m.response})
+            except Exception:
+                pass
+
+        if history:
+            summary_lines.append("")
+            summary_lines.append("\U0001f4dd <b>Previous conversation:</b>")
+            for turn in history:
+                role_label = "\U0001f464 You" if turn["role"] == "user" else "\U0001f916 Claude"
+                # Truncate each message to keep it readable
+                text = turn["text"].strip().split("\n")[0]
+                if len(text) > 80:
+                    text = text[:77] + "..."
+                summary_lines.append(f"  {role_label}: {escape_html(text)}")
+
+        summary_lines.append("")
+        summary_lines.append("Continue chatting to pick up where you left off.")
 
         await query.edit_message_text(
-            f"Resumed session in \U0001f4c2 {project_name} ({msgs} msgs). "
-            f"Continue chatting."
+            "\n".join(summary_lines),
+            parse_mode="HTML",
         )
 
     async def agentic_status(
