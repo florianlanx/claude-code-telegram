@@ -9,6 +9,7 @@ import asyncio
 import os
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -82,6 +83,23 @@ def _redact_secrets(text: str) -> str:
             result,
         )
     return result
+
+
+def _format_time_ago(iso_time: str) -> str:
+    """Format ISO time string to human-readable relative time."""
+    dt = datetime.fromisoformat(iso_time)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    delta = datetime.now(UTC) - dt
+    seconds = delta.total_seconds()
+
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds / 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds / 3600)}h ago"
+    return f"{delta.days}d ago"
 
 
 # Tool name -> friendly emoji mapping for verbose output
@@ -414,6 +432,7 @@ class MessageOrchestrator:
         handlers = [
             ("start", self.agentic_start),
             ("new", self.agentic_new),
+            ("resume", self.agentic_resume),
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
@@ -458,6 +477,14 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
                 pattern=r"^cd:",
+            )
+        )
+
+        # resume: callbacks (for session selection)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_resume_callback),
+                pattern=r"^resume:",
             )
         )
 
@@ -517,6 +544,7 @@ class MessageOrchestrator:
             commands = [
                 BotCommand("start", "Start the bot"),
                 BotCommand("new", "Start a fresh session"),
+                BotCommand("resume", "Resume a previous session"),
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
@@ -613,6 +641,108 @@ class MessageOrchestrator:
         context.user_data["force_new_session"] = True
 
         await update.message.reply_text("Session reset. What's next?")
+
+    async def agentic_resume(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show resumable sessions as inline keyboard for manual selection."""
+        user_id = update.effective_user.id
+        claude_integration = context.bot_data.get("claude_integration")
+
+        if not claude_integration:
+            await update.message.reply_text(
+                "Claude integration not available. Check configuration."
+            )
+            return
+
+        # Get all user sessions (sorted by last_used DESC)
+        sessions = await claude_integration.get_user_sessions(user_id)
+
+        # Filter: must have a real session_id, limit to 8
+        resumable = [s for s in sessions if s.get("session_id")][:8]
+
+        if not resumable:
+            await update.message.reply_text(
+                "No sessions to resume. Send a message to start."
+            )
+            return
+
+        # Build inline keyboard — one session per row
+        buttons = []
+        for s in resumable:
+            project_name = Path(s["project_path"]).name
+            msgs = s["message_count"]
+            expired = s.get("expired", False)
+            time_ago = _format_time_ago(s["last_used"])
+            icon = "\u23f0" if expired else "\U0001f4c2"
+            label = f"{icon} {project_name} \u00b7 {msgs} msgs \u00b7 {time_ago}"
+
+            # Telegram callback_data max 64 bytes; "resume:" (7) + 32 = 39 chars
+            sid = s["session_id"][:32]
+            buttons.append(
+                [InlineKeyboardButton(label, callback_data=f"resume:{sid}")]
+            )
+
+        buttons.append(
+            [InlineKeyboardButton("\u274c Cancel", callback_data="resume:cancel")]
+        )
+
+        await update.message.reply_text(
+            "Select a session to resume:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def _handle_resume_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle resume session selection from inline keyboard."""
+        query = update.callback_query
+        await query.answer()
+
+        data = query.data or ""
+
+        if data == "resume:cancel":
+            await query.edit_message_text("Cancelled.")
+            return
+
+        session_id_prefix = data.split(":", 1)[1] if ":" in data else ""
+        if not session_id_prefix:
+            await query.edit_message_text("Invalid selection.")
+            return
+
+        user_id = update.effective_user.id
+        claude_integration = context.bot_data.get("claude_integration")
+        if not claude_integration:
+            await query.edit_message_text("Claude integration not available.")
+            return
+
+        # Find matching session by prefix
+        sessions = await claude_integration.get_user_sessions(user_id)
+        match = next(
+            (
+                s
+                for s in sessions
+                if s["session_id"].startswith(session_id_prefix)
+            ),
+            None,
+        )
+
+        if not match:
+            await query.edit_message_text("Session not found or already removed.")
+            return
+
+        # Set session context for subsequent messages
+        context.user_data["claude_session_id"] = match["session_id"]
+        context.user_data["current_directory"] = Path(match["project_path"])
+        context.user_data["force_new_session"] = False
+
+        project_name = Path(match["project_path"]).name
+        msgs = match["message_count"]
+
+        await query.edit_message_text(
+            f"Resumed session in \U0001f4c2 {project_name} ({msgs} msgs). "
+            f"Continue chatting."
+        )
 
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
