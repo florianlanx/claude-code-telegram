@@ -153,3 +153,5 @@ FORK_ADAPTATIONS.md
 
 # IDE
 .codebuddy/
+# 如需忽略，请右键菜单并关闭【默认同步Skills】选项
+**/.cursor/commands/skills-*.md
