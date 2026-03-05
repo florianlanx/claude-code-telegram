@@ -82,8 +82,8 @@ def deps():
     }
 
 
-def test_agentic_registers_5_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo commands."""
+def test_agentic_registers_6_commands(agentic_settings, deps):
+    """Agentic mode registers start, new, status, verbose, repo, restart commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -100,16 +100,17 @@ def test_agentic_registers_5_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 5
+    assert len(cmd_handlers) == 6
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
     assert frozenset({"verbose"}) in commands
     assert frozenset({"repo"}) in commands
+    assert frozenset({"restart"}) in commands
 
 
-def test_classic_registers_13_commands(classic_settings, deps):
-    """Classic mode registers all 13 commands."""
+def test_classic_registers_14_commands(classic_settings, deps):
+    """Classic mode registers all 14 commands."""
     orchestrator = MessageOrchestrator(classic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -124,11 +125,11 @@ def test_classic_registers_13_commands(classic_settings, deps):
         if isinstance(call[0][0], CommandHandler)
     ]
 
-    assert len(cmd_handlers) == 13
+    assert len(cmd_handlers) == 14
 
 
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
-    """Agentic mode registers text, document, and photo message handlers."""
+    """Agentic mode registers text, document, photo, and voice message handlers."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -148,32 +149,59 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    # 3 message handlers (text, document, photo)
-    assert len(msg_handlers) == 3
+    # 4 message handlers (text, document, photo, voice)
+    assert len(msg_handlers) == 4
     # 1 callback handler (for cd: only)
     assert len(cb_handlers) == 1
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 5 bot commands."""
+    """Agentic mode returns 6 bot commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 5
+    assert len(commands) == 6
     cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo"]
+    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart"]
 
 
 async def test_classic_bot_commands(classic_settings, deps):
-    """Classic mode returns 13 bot commands."""
+    """Classic mode returns 14 bot commands."""
     orchestrator = MessageOrchestrator(classic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 13
+    assert len(commands) == 14
     cmd_names = [c.command for c in commands]
     assert "start" in cmd_names
     assert "help" in cmd_names
     assert "git" in cmd_names
+    assert "restart" in cmd_names
+
+
+async def test_restart_command_sends_sigterm(deps):
+    """restart_command sends SIGTERM to the current process."""
+    from unittest.mock import patch
+
+    from src.bot.handlers.command import restart_command
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.bot_data = {"audit_logger": None}
+
+    with patch("src.bot.handlers.command.os.kill") as mock_kill:
+        await restart_command(update, context)
+
+    import os
+    import signal
+
+    mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+    # Verify confirmation message was sent
+    update.message.reply_text.assert_called_once()
+    msg = update.message.reply_text.call_args[0][0]
+    assert "Restarting" in msg
 
 
 async def test_agentic_start_no_keyboard(agentic_settings, deps):
@@ -333,6 +361,128 @@ async def test_agentic_document_rejects_large_files(agentic_settings, deps):
 
     call_args = update.message.reply_text.call_args
     assert "too large" in call_args.args[0].lower()
+
+
+async def test_agentic_voice_calls_claude(agentic_settings, deps):
+    """Agentic voice handler transcribes and routes prompt to Claude."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    mock_response = MagicMock()
+    mock_response.session_id = "voice-session-123"
+    mock_response.content = "Voice response from Claude"
+    mock_response.tools_used = []
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=mock_response)
+
+    processed_voice = MagicMock()
+    processed_voice.prompt = "Voice prompt text"
+
+    voice_handler = MagicMock()
+    voice_handler.process_voice_message = AsyncMock(return_value=processed_voice)
+
+    features = MagicMock()
+    features.get_voice_handler.return_value = voice_handler
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.voice = MagicMock()
+    update.message.caption = "please summarize"
+    update.message.message_id = 1
+    update.message.chat.send_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+
+    progress_msg = AsyncMock()
+    progress_msg.edit_text = AsyncMock()
+    progress_msg.delete = AsyncMock()
+    update.message.reply_text.return_value = progress_msg
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {
+        "settings": agentic_settings,
+        "features": features,
+        "claude_integration": claude_integration,
+    }
+
+    await orchestrator.agentic_voice(update, context)
+
+    voice_handler.process_voice_message.assert_awaited_once_with(
+        update.message.voice, "please summarize"
+    )
+    claude_integration.run_command.assert_awaited_once()
+    assert context.user_data["claude_session_id"] == "voice-session-123"
+
+
+async def test_agentic_voice_missing_handler_is_provider_aware(tmp_path, deps):
+    """Missing voice handler guidance references the configured provider key."""
+    settings = create_test_config(
+        approved_directory=str(tmp_path),
+        agentic_mode=True,
+        voice_provider="openai",
+    )
+    orchestrator = MessageOrchestrator(settings, deps)
+
+    features = MagicMock()
+    features.get_voice_handler.return_value = None
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.bot_data = {"features": features}
+    context.user_data = {}
+
+    await orchestrator.agentic_voice(update, context)
+
+    call_args = update.message.reply_text.call_args
+    assert "OPENAI_API_KEY" in call_args.args[0]
+
+
+async def test_agentic_voice_transcription_failure_surfaces_user_error(
+    agentic_settings, deps
+):
+    """Transcription failures are shown to users and do not call Claude."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    voice_handler = MagicMock()
+    voice_handler.process_voice_message = AsyncMock(
+        side_effect=RuntimeError("Mistral transcription request failed: boom")
+    )
+
+    features = MagicMock()
+    features.get_voice_handler.return_value = voice_handler
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.voice = MagicMock()
+    update.message.caption = None
+    update.message.chat.send_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+
+    progress_msg = AsyncMock()
+    progress_msg.edit_text = AsyncMock()
+    update.message.reply_text.return_value = progress_msg
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {
+        "settings": agentic_settings,
+        "features": features,
+        "claude_integration": claude_integration,
+    }
+
+    await orchestrator.agentic_voice(update, context)
+
+    progress_msg.edit_text.assert_awaited_once()
+    error_text = progress_msg.edit_text.call_args.args[0]
+    assert "Mistral transcription request failed" in error_text
+    assert progress_msg.edit_text.call_args.kwargs["parse_mode"] == "HTML"
+    claude_integration.run_command.assert_not_awaited()
 
 
 async def test_agentic_start_escapes_html_in_name(agentic_settings, deps):

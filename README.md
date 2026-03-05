@@ -194,6 +194,7 @@ Enable with `ENABLE_API_SERVER=true` and `ENABLE_SCHEDULER=true`. See [docs/setu
 - Directory sandboxing with path traversal prevention
 - File upload handling with archive extraction
 - Image/screenshot upload with analysis
+- Voice message transcription (Mistral Voxtral / OpenAI Whisper)
 - Git integration with safe repository operations
 - Quick actions system with context-aware buttons
 - Session export in Markdown, HTML, and JSON formats
@@ -362,6 +363,10 @@ Each command commits, tags, and pushes automatically, triggering CI tests and a 
 ## License
 
 MIT License -- see [LICENSE](LICENSE).
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=RichardAtCT/claude-code-telegram&type=Date)](https://star-history.com/#RichardAtCT/claude-code-telegram&Date)
 
 ## Acknowledgments
 

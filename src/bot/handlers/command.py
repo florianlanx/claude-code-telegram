@@ -1,5 +1,8 @@
 """Command handlers for bot operations."""
 
+import os
+import signal
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +15,7 @@ from ...config.settings import Settings
 from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
+from ...storage.models import SessionModel
 from ..utils.html_format import escape_html
 
 logger = structlog.get_logger()
@@ -1098,8 +1102,15 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         # Get context-aware actions
+        now = datetime.now(timezone.utc)
         actions = await quick_action_manager.get_suggestions(
-            session_data={"working_directory": str(current_dir), "user_id": user_id}
+            session=SessionModel(
+                session_id="",  # ephemeral session for quick actions context
+                user_id=user_id,
+                project_path=str(current_dir),
+                created_at=now,
+                last_used=now,
+            )
         )
 
         if not actions:
@@ -1219,6 +1230,34 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         await update.message.reply_text(f"❌ <b>Git Error</b>\n\n{str(e)}")
         logger.error("Error in git_command", error=str(e), user_id=user_id)
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /restart command - gracefully restart the bot process.
+
+    Sends a confirmation message then triggers SIGTERM so systemd
+    (or any process manager with restart-on-exit) brings the bot back up.
+
+    Auth: protected by the auth middleware (group -2) which raises
+    ``ApplicationHandlerStop`` for unauthenticated users before any
+    handler in group 10 runs.  No per-handler check is needed.
+    """
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+
+    await update.message.reply_text(
+        "🔄 <b>Restarting bot…</b>\n\nBack shortly.",
+        parse_mode="HTML",
+    )
+
+    if audit_logger:
+        await audit_logger.log_command(user_id, "restart", [], True)
+
+    logger.info("Restart requested via /restart command", user_id=user_id)
+
+    # SIGTERM triggers the existing graceful-shutdown handler in main.py;
+    # systemd Restart=always will bring the process back up.
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 def _format_file_size(size: int) -> str:
